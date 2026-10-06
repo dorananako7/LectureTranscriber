@@ -3,7 +3,7 @@ import whisper
 from scipy.signal import resample_poly
 from math import gcd
 from time import perf_counter
-from datetime import datetime, timedalta
+from datetime import datetime, timedelta
 import sys
 import numpy
 from queue import Queue, Empty, Full
@@ -49,48 +49,134 @@ def transcribe_audio(audio, sample_rate, model):
     elapsed = perf_counter() - started
     return result["text"].strip(), elapsed
 
+def audio_callback(indata, frames, time_info, status):
+    if status.input_overflow:
+        input_overflow.set()
+        
+    try:
+        audio_queue.put_nowait(indata.copy())
+    except Full:
+        queue_full.set()
+        raise sounddevice.CallbackAbort
+
+recording_started = datetime.now()
+date_text = recording_started.strftime("%Y/%m/%d")
+
+markdown_text = (
+    f"# {lecture_name}\n\n"
+    f"{date_text}\n\n"
+)
+
+blocks = []
+buffered_frames = 0
+processed_frames = 0
+
+# 複数のブロックをまとめて文字起こしする関数
+def process_blocks(blocks, processed_frames):
+    audio = numpy.concatenate(blocks, axis=0)
+    
+    # 録音開始時刻 + 処理済みの音声の長さ
+    chunk_started = recording_started + timedelta(
+        seconds = processed_frames / sample_rate
+    )
+    
+    text, elapsed = transcribe_audio(audio, sample_rate, model)
+    time_text = chunk_started.strftime("%H:%M:%S")
+    
+    print(f"\n{time_text}")
+    print(text)
+    print(f"処理時間: {elapsed:.2f}秒")
+    
+    markdown_part = (
+        f"## {time_text}\n\n"
+        f"{text}\n\n"
+    )
+    
+    return markdown_part, len(audio)
+
+
+# main
 print("モデル読み込み中")
 model = whisper.load_model("base", device="cpu")
 
 sample_rate = int(sounddevice.query_devices(kind="input")["default_samplerate"]) #マイクの既定のサンプルレートにする
-# duration = 5 #録音時間
-# print("録音開始")
-# recording_started = datetime.now()
-# audio = sounddevice.rec(
-#     frames=int(sample_rate * duration),
-#     samplerate=sample_rate,
-#     channels=1, #モノラル
-#     dtype="float32",
-# )
-
-# sounddevice.wait()
-
-# print("再生")
-# sounddevice.play(audio, samplerate=sample_rate)
-# sounddevice.wait()
-
-# print("文字起こし中")
-# text, elapsed = transcribe_audio(audio, sample_rate, model)
 
 
-# print(f"\n文字起こし結果:")
-# print(recording_started.strftime("%H:%M:%S"))
-# print(text)
-# print(f"\n処理時間: {elapsed:2f}秒")
+#役0.5秒分ずつ音声を受け取る
+block_frames = int(sample_rate * 0.5)
+
+# 5秒分たまったら文字起こしする
+chunk_frames = int(sample_rate * 5)
+
+# 最大120ブロック(役50秒分)を待機させる
+audio_queue = Queue(maxsize=120)
+queue_full = Event()
+input_overflow = Event()
 
 
-# date_text = recording_started.strftime("%Y/%m/%d")
-# time_text = recording_started.strftime("%H:%M:%S")
 
+print("録音開始。Ctrl + Cで停止・保存します。")
+try:
+    with sounddevice.InputStream(
+        samplerate = sample_rate,
+        channels=1,
+        dtype="float32",
+        blocksize=block_frames,
+        callback=audio_callback,
+    ):
+        while not queue_full.is_set():
+            try:
+                block = audio_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            
+            blocks.append(block)
+            buffered_frames += len(block)
+            
+            if buffered_frames >= chunk_frames:
+                part, frames = process_blocks(
+                    blocks, processed_frames
+                )
+                
+                markdown_text += part
+                processed_frames += frames
+                
+                blocks = []
+                buffered_frames = 0
 
-# markdown_text = (
-#     f"# {lecture_name}\n"
-#     f"{date_text}\n\n"
-#     f"## {time_text}\n"
-#     f"{text}\n"
-# )
+except KeyboardInterrupt:
+    print(f"\n録音を停止します")
+    
+if queue_full.is_set():
+    print("未処理音声が上限に達したため、録音を停止しました")
+    
+if input_overflow.is_set():
+    print(f"警告: マイク入力で音声の欠落が発生しました")
+    
+# 録音停止後、キュ０に残った音声も処理する
+print("残りの音声を処理中")
 
-# 同名ファイルが有れば更新をつける
+while True:
+    try:
+        block = audio_queue.get_nowait()
+    except Empty:
+        break
+    
+    blocks.append(block)
+    buffered_frames += len(block)
+
+    if buffered_frames >= chunk_frames:
+        part, frames = process_blocks(blocks, processed_frames)
+        markdown_text += part
+        processed_frames += frames
+
+        blocks = []
+        buffered_frames = 0
+
+# 最後の5秒未満の音声も処理する
+if blocks:
+    part, frames = process_blocks(blocks, processed_frames)
+    markdown_text += part
 
 
 base_name = f"{lecture_name}"
